@@ -1,0 +1,130 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ !github.event.deleted }}
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+          - target: aarch64-pc-windows-msvc
+            runner: windows-2022
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build all binaries
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --workspace --bins
+          force-use-cross: ${{ runner.os == 'Linux' }}
+
+      - name: Stage release binaries
+        shell: python
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          import json
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          target = os.environ["TARGET"]
+          suffix = ".exe" if target.endswith("-windows-msvc") else ""
+          metadata = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"
+          ]))
+          release_dir = Path(metadata["target_directory"]) / target / "release"
+          dist = Path(os.environ["RUNNER_TEMP"]) / "release-assets"
+          dist.mkdir()
+          for package in metadata["packages"]:
+              for item in package["targets"]:
+                  if "bin" not in item["kind"]:
+                      continue
+                  name = item["name"]
+                  binary = release_dir / f"{name}{suffix}"
+                  bin_dir = dist / name
+                  bin_dir.mkdir(exist_ok=True)
+                  asset = bin_dir / f"{name}-{target}{suffix}"
+                  if not binary.is_file():
+                      raise SystemExit(f"Missing binary: {binary}. Check required-features.")
+                  if asset.exists():
+                      raise SystemExit(f"Duplicate binary name in workspace: {name}")
+                  shutil.copy2(binary, asset)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-assets/
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install 7-Zip if needed
+        run: |
+          if ! command -v 7z >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y p7zip-full
+          fi
+
+      - name: Create one 7z archive per binary
+        shell: python
+        run: |
+          import subprocess
+          from pathlib import Path
+
+          archives = Path("archives").resolve()
+          archives.mkdir()
+          for bin_dir in sorted(Path("dist").iterdir()):
+              name = bin_dir.name
+              files = [
+                  f"{name}-x86_64-pc-windows-msvc.exe",
+                  f"{name}-aarch64-pc-windows-msvc.exe",
+                  f"{name}-x86_64-unknown-linux-musl",
+                  f"{name}-aarch64-unknown-linux-musl",
+              ]
+              for filename in files:
+                  binary = bin_dir / filename
+                  if not binary.is_file():
+                      raise SystemExit(f"Missing binary: {filename}")
+                  if not filename.endswith(".exe"):
+                      binary.chmod(0o755)
+              subprocess.run(
+                  ["7z", "a", "-t7z", str(archives / f"{name}.7z"), "--", *files],
+                  cwd=bin_dir, check=True,
+              )
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          files: archives/*.7z
